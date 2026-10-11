@@ -1,4 +1,3 @@
-
 """
 Pin Bar + Trend Alert Bot (Deriv Boom/Crash) - GitHub Actions version
 =====================================================================
@@ -89,7 +88,7 @@ def send_voice_alert() -> None:
         with open(VOICE_FILE, "rb") as f:
             resp = requests.post(
                 url,
-                data={"chat_id": TELEGRAM_CHAT_ID, "title": VOICE_TEXT},
+                data={"chat_id": TELEGRAM_CHAT_ID, "title": VOICE_TEXT, "disable_notification": True},
                 files={"audio": f},
                 timeout=30,
             )
