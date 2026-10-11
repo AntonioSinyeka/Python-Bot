@@ -1,3 +1,4 @@
+
 """
 Pin Bar + Trend Alert Bot (Deriv Boom/Crash) - GitHub Actions version
 =====================================================================
@@ -29,8 +30,7 @@ except ImportError:
 
 # ----------------------------- CONFIG ---------------------------------
 
-DERIV_APP_ID = os.getenv("DERIV_APP_ID", "1089")
-DERIV_WS_URL = f"wss://ws.derivws.com/websockets/v3?app_id={DERIV_APP_ID}"
+DERIV_WS_URL = "wss://api.derivws.com/trading/v1/options/ws/public"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
