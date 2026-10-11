@@ -32,8 +32,8 @@ except ImportError:
 DERIV_APP_ID = os.getenv("DERIV_APP_ID", "1089")
 DERIV_WS_URL = f"wss://ws.derivws.com/websockets/v3?app_id={DERIV_APP_ID}"
 
-TELEGRAM_BOT_TOKEN = os.getenv("8954808516:AAGqKOoAWOi96uzGA2hCdavx02YQTfbjZuI", "")
-TELEGRAM_CHAT_ID = os.getenv("141865137", "8141865137")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 SYMBOLS = ["BOOM900", "CRASH900"]
 
@@ -85,11 +85,11 @@ def send_voice_alert() -> None:
     """Generate the spoken clip and send it as an audio message."""
     try:
         gTTS(VOICE_TEXT).save(VOICE_FILE)
-        url = f"https://api.telegram.org/bot8954808516:AAGqKOoAWOi96uzGA2hCdavx02YQTfbjZuI/sendAudio"
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendAudio"
         with open(VOICE_FILE, "rb") as f:
             resp = requests.post(
                 url,
-                data={"chat_id": 8141865137, "title": VOICE_TEXT},
+                data={"chat_id": TELEGRAM_CHAT_ID, "title": VOICE_TEXT},
                 files={"audio": f},
                 timeout=30,
             )
