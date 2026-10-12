@@ -34,7 +34,15 @@ DERIV_WS_URL = "wss://api.derivws.com/trading/v1/options/ws/public"
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-SYMBOLS = ["BOOM900", "CRASH900"]
+SYMBOLS = [
+    "BOOM300N", "BOOM500", "BOOM600", "BOOM900", "BOOM1000",
+    "CRASH300N", "CRASH500", "CRASH600", "CRASH900", "CRASH1000",
+]
+
+# Boom -> bearish pin bars only (sell), Crash -> bullish only (buy)
+SYMBOL_DIRECTION = {
+    s: ("bearish" if s.startswith("BOOM") else "bullish") for s in SYMBOLS
+}
 
 # Boom only alerts on bearish pin bars (sell), Crash only on bullish (buy).
 SYMBOL_DIRECTION = {
