@@ -52,7 +52,7 @@ SYMBOL_DIRECTION = {
 
 RSI_PERIOD = 10
 H1_GRANULARITY = 3600
-H4_GRANULARITY = 14400
+H4_GRANULARITY = 3600
 CANDLE_COUNT = 60
 
 PIN_WICK_RATIO = 0.66
@@ -193,8 +193,8 @@ async def check_symbol(ws, symbol: str) -> bool:
         print(f"[{symbol}] no pin bar")
         return False
 
-    allowed = SYMBOL_DIRECTION.get(symbol)
-    if allowed and pin_direction != allowed:
+        allowed = "bearish" if symbol.startswith("BOOM") else "bullish"
+        if pin_direction != allowed:
         print(f"[{symbol}] {pin_direction} pin bar ignored (only {allowed} allowed)")
         return False
 
@@ -208,7 +208,9 @@ async def check_symbol(ws, symbol: str) -> bool:
     message = (
         f"🚨 Takondwa, check your trades!\n"
         f"Pin Bar Alert - {symbol}\n"
-        f"Signal: {action} ({pin_direction.upper()} pin bar, H4 RSI bias: {bias})\n"
+        f"Signal: {action} ({pin_direction.upper()} pin bar, H1
+        
+        RSI bias: {bias})\n"
         f"H1 candle close: {last_closed_h1['close']}\n"
         f"Candle time: {ts}"
     )
