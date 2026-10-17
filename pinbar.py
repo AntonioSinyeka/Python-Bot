@@ -193,8 +193,8 @@ async def check_symbol(ws, symbol: str) -> bool:
         print(f"[{symbol}] no pin bar")
         return False
 
-        allowed = "bearish" if symbol.startswith("BOOM") else "bullish"
-        if pin_direction != allowed:
+    allowed = "bearish" if symbol.startswith("BOOM") else "bullish"
+    if pin_direction != allowed:
         print(f"[{symbol}] {pin_direction} pin bar ignored (only {allowed} allowed)")
         return False
 
