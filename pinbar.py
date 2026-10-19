@@ -188,6 +188,8 @@ async def check_symbol(ws, symbol: str) -> bool:
         print(f"[{symbol}] last closed H1 is outside the alert window, skipping")
         return False
 
+   (only {allowed} allowed)")
+        return False
     pin_direction = detect_pin_bar(last_closed_h1)
     if pin_direction is None:
         print(f"[{symbol}] no pin bar")
@@ -197,6 +199,8 @@ async def check_symbol(ws, symbol: str) -> bool:
     if pin_direction != allowed:
         print(f"[{symbol}] {pin_direction} pin bar ignored (only {allowed} allowed)")
         return False
+
+    bias = get_h4_bias(df_h4)
 
     bias = get_h4_bias(df_h4)
     if pin_direction != bias:
