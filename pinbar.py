@@ -188,7 +188,7 @@ async def check_symbol(ws, symbol: str) -> bool:
         print(f"[{symbol}] last closed H1 is outside the alert window, skipping")
         return False
 
-   (only {allowed} allowed)")
+
         return False
     pin_direction = detect_pin_bar(last_closed_h1)
     if pin_direction is None:
