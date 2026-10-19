@@ -1,10 +1,16 @@
 """
-Pin Bar + Trend Alert Bot (Deriv Boom/Crash) - GitHub Actions version
-=====================================================================
+Pin Bar + Trend Alert Bot (Deriv) - GitHub Actions version
+==========================================================
 
-Runs ONCE per invocation (GitHub Actions starts it every hour), checks the
-last closed H1 candle for a pin bar that agrees with the H4 RSI bias, and
-sends a Telegram text + voice alert: "Takondwa, check your trades".
+Runs ONCE per invocation (GitHub Actions starts it every hour). For each
+symbol it checks the last closed H1 candle for a pin bar that agrees with
+the H1 RSI bias, then sends a Telegram text + voice alert.
+
+Rules:
+  - BOOM indices  -> only BEARISH pin bars (SELL)
+  - CRASH indices -> only BULLISH pin bars (BUY)
+  - Gold / forex  -> both directions, as long as the pin bar agrees with
+                     the RSI bias
 
 Signal bot only -- it does not place trades.
 """
@@ -29,30 +35,30 @@ except ImportError:
 
 # ----------------------------- CONFIG ---------------------------------
 
+# Public market-data gateway (no login or token needed for candles)
 DERIV_WS_URL = "wss://api.derivws.com/trading/v1/options/ws/public"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-SYMBOLS = [
-    "BOOM300N", "BOOM500", "BOOM600", "BOOM900", "BOOM1000",
-    "CRASH300N", "CRASH500", "CRASH600", "CRASH900", "CRASH1000",
+BOOM_SYMBOLS = ["BOOM100", "BOOM300N", "BOOM500", "BOOM600", "BOOM900", "BOOM1000"]
+CRASH_SYMBOLS = ["CRASH100", "CRASH300N", "CRASH500", "CRASH600", "CRASH900", "CRASH1000"]
+GOLD_AND_FOREX = [
+    "frxXAUUSD",   # gold
+    "frxEURUSD",
+    "frxGBPUSD",
+    "frxUSDJPY",
+    "frxUSDCHF",
+    "frxAUDUSD",
+    "frxUSDCAD",
+    "frxNZDUSD",
 ]
-
-# Boom -> bearish pin bars only (sell), Crash -> bullish only (buy)
-SYMBOL_DIRECTION = {
-    s: ("bearish" if s.startswith("BOOM") else "bullish") for s in SYMBOLS
-}
-
-# Boom only alerts on bearish pin bars (sell), Crash only on bullish (buy).
-SYMBOL_DIRECTION = {
-    "BOOM900": "bearish",
-    "CRASH900": "bullish",
-}
+SYMBOLS = BOOM_SYMBOLS + CRASH_SYMBOLS + GOLD_AND_FOREX
 
 RSI_PERIOD = 10
-H1_GRANULARITY = 3600
-H4_GRANULARITY = 3600
+H1_GRANULARITY = 3600        # candles used for pin bar detection
+BIAS_GRANULARITY = 3600      # candles used for the RSI trend bias (3600 = H1, 14400 = H4)
+BIAS_LABEL = "H1" if BIAS_GRANULARITY == 3600 else "H4"
 CANDLE_COUNT = 60
 
 PIN_WICK_RATIO = 0.66
@@ -60,15 +66,23 @@ PIN_BODY_RATIO = 0.33
 PIN_OPPOSITE_WICK_RATIO = 0.15
 
 # Only alert if the pin bar candle closed within this many seconds.
-# The workflow runs hourly, so each candle is seen by exactly one run
-# (this is what prevents duplicate alerts, since nothing is remembered
-# between runs). Keep this below 3600.
+# The workflow runs hourly, so each candle is seen by one run; this is what
+# stops duplicate alerts (nothing is remembered between runs). Keep < 3600.
 ALERT_WINDOW_SECONDS = 55 * 60
 
 VOICE_TEXT = "Takondwa, check your trades"
 VOICE_FILE = "alert.mp3"
 
 # ------------------------------------------------------------------------
+
+
+def allowed_direction(symbol: str):
+    """Boom -> bearish only, Crash -> bullish only, anything else -> both."""
+    if symbol.startswith("BOOM"):
+        return "bearish"
+    if symbol.startswith("CRASH"):
+        return "bullish"
+    return None
 
 
 def telegram_ready() -> bool:
@@ -89,14 +103,18 @@ def send_telegram_alert(message: str) -> None:
 
 
 def send_voice_alert() -> None:
-    """Generate the spoken clip and send it as an audio message."""
+    """Generate the spoken clip and send it silently (the text alert is the one that notifies)."""
     try:
         gTTS(VOICE_TEXT).save(VOICE_FILE)
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendAudio"
         with open(VOICE_FILE, "rb") as f:
             resp = requests.post(
                 url,
-                data={"chat_id": TELEGRAM_CHAT_ID, "title": VOICE_TEXT, "disable_notification": True},
+                data={
+                    "chat_id": TELEGRAM_CHAT_ID,
+                    "title": VOICE_TEXT,
+                    "disable_notification": True,
+                },
                 files={"audio": f},
                 timeout=30,
             )
@@ -122,6 +140,8 @@ async def fetch_candles(ws, symbol: str, granularity: int, count: int) -> pd.Dat
         raise RuntimeError(f"Deriv API error for {symbol}: {response['error']['message']}")
 
     df = pd.DataFrame(response.get("candles", []))
+    if df.empty:
+        raise RuntimeError(f"No candles returned for {symbol}")
     for col in ["open", "high", "low", "close"]:
         df[col] = df[col].astype(float)
     return df
@@ -141,8 +161,8 @@ def compute_rsi(closes: pd.Series, period: int = 14) -> pd.Series:
     return rsi.fillna(50)
 
 
-def get_h4_bias(df_h4: pd.DataFrame) -> str:
-    closed = df_h4.iloc[:-1]  # drop the still-forming H4 candle
+def get_bias(df_bias: pd.DataFrame) -> str:
+    closed = df_bias.iloc[:-1]  # drop the still-forming candle
     rsi = compute_rsi(closed["close"], RSI_PERIOD)
     return "bullish" if rsi.iloc[-1] > 50 else "bearish"
 
@@ -171,12 +191,15 @@ async def check_symbol(ws, symbol: str) -> bool:
     """Returns True if an alert was sent."""
     try:
         df_h1 = await fetch_candles(ws, symbol, H1_GRANULARITY, CANDLE_COUNT)
-        df_h4 = await fetch_candles(ws, symbol, H4_GRANULARITY, CANDLE_COUNT)
+        if BIAS_GRANULARITY == H1_GRANULARITY:
+            df_bias = df_h1
+        else:
+            df_bias = await fetch_candles(ws, symbol, BIAS_GRANULARITY, CANDLE_COUNT)
     except Exception as exc:
         print(f"[{symbol}] fetch error: {exc}")
         return False
 
-    if len(df_h1) < 2 or len(df_h4) < RSI_PERIOD + 2:
+    if len(df_h1) < 2 or len(df_bias) < RSI_PERIOD + 2:
         print(f"[{symbol}] not enough candles")
         return False
 
@@ -185,26 +208,22 @@ async def check_symbol(ws, symbol: str) -> bool:
     age = time.time() - (epoch + H1_GRANULARITY)  # seconds since that candle closed
 
     if age < 0 or age > ALERT_WINDOW_SECONDS:
-        print(f"[{symbol}] last closed H1 is outside the alert window, skipping")
+        print(f"[{symbol}] last closed H1 is outside the alert window (market closed?), skipping")
         return False
 
-
-        return False
     pin_direction = detect_pin_bar(last_closed_h1)
     if pin_direction is None:
         print(f"[{symbol}] no pin bar")
         return False
 
-    allowed = "bearish" if symbol.startswith("BOOM") else "bullish"
-    if pin_direction != allowed:
-        print(f"[{symbol}] {pin_direction} pin bar ignored (only {allowed} allowed)")
+    allowed = allowed_direction(symbol)
+    if allowed is not None and pin_direction != allowed:
+        print(f"[{symbol}] {pin_direction} ignored")
         return False
 
-    bias = get_h4_bias(df_h4)
-
-    bias = get_h4_bias(df_h4)
+    bias = get_bias(df_bias)
     if pin_direction != bias:
-        print(f"[{symbol}] {pin_direction} pin bar disagrees with H4 bias ({bias})")
+        print(f"[{symbol}] {pin_direction} pin bar disagrees with {BIAS_LABEL} bias ({bias})")
         return False
 
     ts = datetime.fromtimestamp(epoch, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
@@ -212,9 +231,7 @@ async def check_symbol(ws, symbol: str) -> bool:
     message = (
         f"🚨 Takondwa, check your trades!\n"
         f"Pin Bar Alert - {symbol}\n"
-        f"Signal: {action} ({pin_direction.upper()} pin bar, H1
-        
-        RSI bias: {bias})\n"
+        f"Signal: {action} ({pin_direction.upper()} pin bar, {BIAS_LABEL} RSI bias: {bias})\n"
         f"H1 candle close: {last_closed_h1['close']}\n"
         f"Candle time: {ts}"
     )
@@ -232,6 +249,7 @@ async def run_checks() -> None:
             async with websockets.connect(DERIV_WS_URL, open_timeout=20) as ws:
                 for symbol in SYMBOLS:
                     await check_symbol(ws, symbol)
+                    await asyncio.sleep(0.3)  # stay well under Deriv's rate limit
             return
         except Exception as exc:
             last_exc = exc
