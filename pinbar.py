@@ -63,7 +63,7 @@ CANDLE_COUNT = 60
 
 PIN_WICK_RATIO = 0.66
 PIN_BODY_RATIO = 0.33
-PIN_OPPOSITE_WICK_RATIO = 0.15
+PIN_OPPOSITE_WICK_RATIO = 0.25
 
 # Only alert if the pin bar candle closed within this many seconds.
 # The workflow runs hourly, so each candle is seen by one run; this is what
