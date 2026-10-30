@@ -1,5 +1,5 @@
 """
-Pin Bar + Trend Alert Bot (Deriv) - GitHub Actions version
+Pin Bar / Doji + Trend Alert Bot (Deriv) - GitHub Actions version
 ==========================================================
 
 Runs ONCE per invocation (GitHub Actions starts it every hour). For each
@@ -9,8 +9,8 @@ the H1 RSI bias, then sends a Telegram text + voice alert.
 Rules:
   - BOOM indices  -> only BEARISH pin bars (SELL)
   - CRASH indices -> only BULLISH pin bars (BUY)
-  - Gold / forex  -> both directions, as long as the pin bar agrees with
-                     the RSI bias
+  - Gold / forex / Volatility -> both directions, as long as the pin bar
+                     agrees with the RSI bias (and the 200 EMA, if enabled)
 
 Signal bot only -- it does not place trades.
 """
@@ -53,22 +53,46 @@ GOLD_AND_FOREX = [
     "frxUSDCAD",
     "frxNZDUSD",
 ]
-SYMBOLS = BOOM_SYMBOLS + CRASH_SYMBOLS + GOLD_AND_FOREX
+# Volatility indices: regular ones, plus the "1s" (one-second tick) versions
+VOLATILITY_SYMBOLS = [
+    "R_10", "R_25", "R_50", "R_75", "R_100",
+    "1HZ10V", "1HZ25V", "1HZ50V", "1HZ75V", "1HZ100V",
+]
+SYMBOLS = BOOM_SYMBOLS + CRASH_SYMBOLS + VOLATILITY_SYMBOLS + GOLD_AND_FOREX
 
 RSI_PERIOD = 10
 H1_GRANULARITY = 3600        # candles used for pin bar detection
 BIAS_GRANULARITY = 3600      # candles used for the RSI trend bias (3600 = H1, 14400 = H4)
 BIAS_LABEL = "H1" if BIAS_GRANULARITY == 3600 else "H4"
-CANDLE_COUNT = 60
+CANDLE_COUNT = 1000          # history per symbol (the 200 EMA needs a long warm-up)
+
+# 200 EMA trend filter on H1: BUY only when the pin bar closes ABOVE the EMA,
+# SELL only when it closes BELOW it.
+# Applied to Boom/Crash too: Boom SELLs only below the EMA, Crash BUYs only above it.
+# Set APPLY_EMA_TO_BOOM_CRASH = False to turn the EMA rule off for those indices.
+EMA_PERIOD = 200
+APPLY_EMA_TO_BOOM_CRASH = True
+APPLY_EMA_TO_VOLATILITY = True   # set False to skip the EMA rule on Volatility indices
 
 PIN_WICK_RATIO = 0.66
 PIN_BODY_RATIO = 0.33
-PIN_OPPOSITE_WICK_RATIO = 0.25
+PIN_OPPOSITE_WICK_RATIO = 0.15
 
 # Only alert if the pin bar candle closed within this many seconds.
 # The workflow runs hourly, so each candle is seen by one run; this is what
 # stops duplicate alerts (nothing is remembered between runs). Keep < 3600.
 ALERT_WINDOW_SECONDS = 55 * 60
+
+# Doji at a key level (support / resistance) -- a second pattern besides pin bars.
+ENABLE_DOJI = True
+DOJI_BODY_RATIO = 0.10          # body must be <= 10% of the candle's range
+DOJI_MIN_RANGE_ATR = 0.5        # candle range must be >= 0.5 x ATR (ignores tiny, meaningless candles)
+ATR_PERIOD = 14
+KEY_LEVEL_LOOKBACK = 150        # H1 candles searched for swing highs / lows (about 6 days)
+PIVOT_STRENGTH = 3              # a swing point beats the 3 candles on each side of it
+KEY_LEVEL_MIN_TOUCHES = 2       # a level counts only if price turned there at least twice before
+KEY_LEVEL_TOLERANCE_ATR = 0.3   # "at the level" = doji high/low within 0.3 x ATR of it
+DOJI_REQUIRE_BIAS = True        # False = skip the RSI bias rule for doji signals
 
 VOICE_TEXT = "Takondwa, check your trades"
 VOICE_FILE = "alert.mp3"
@@ -83,6 +107,14 @@ def allowed_direction(symbol: str):
     if symbol.startswith("CRASH"):
         return "bullish"
     return None
+
+
+def ema_filter_applies(symbol: str) -> bool:
+    if symbol.startswith(("BOOM", "CRASH")):
+        return APPLY_EMA_TO_BOOM_CRASH
+    if symbol in VOLATILITY_SYMBOLS:
+        return APPLY_EMA_TO_VOLATILITY
+    return True
 
 
 def telegram_ready() -> bool:
@@ -187,6 +219,61 @@ def detect_pin_bar(candle: pd.Series):
     return None
 
 
+def compute_atr(df: pd.DataFrame, period: int = 14) -> float:
+    """Wilder's ATR; returns the value at the last candle of df."""
+    prev_close = df["close"].shift(1)
+    tr = pd.concat(
+        [df["high"] - df["low"], (df["high"] - prev_close).abs(), (df["low"] - prev_close).abs()],
+        axis=1,
+    ).max(axis=1)
+    return float(tr.ewm(alpha=1 / period, min_periods=period, adjust=False).mean().iloc[-1])
+
+
+def is_doji(candle: pd.Series, atr: float) -> bool:
+    rng = candle["high"] - candle["low"]
+    if rng <= 0 or atr is None or np.isnan(atr) or atr <= 0:
+        return False
+    if rng < DOJI_MIN_RANGE_ATR * atr:
+        return False
+    return abs(candle["close"] - candle["open"]) / rng <= DOJI_BODY_RATIO
+
+
+def doji_at_key_level(df: pd.DataFrame, doji: pd.Series, atr: float):
+    """Returns ('support' | 'resistance', level_price) or None.
+
+    Key levels are swing lows / highs found in the candles BEFORE the doji.
+    The doji is "at" a level when its low (support) or high (resistance) is
+    within KEY_LEVEL_TOLERANCE_ATR x ATR of at least KEY_LEVEL_MIN_TOUCHES
+    earlier swing points.
+    """
+    sub = df.iloc[:-2].tail(KEY_LEVEL_LOOKBACK).reset_index(drop=True)  # excludes doji and forming candle
+    n = PIVOT_STRENGTH
+    if len(sub) < 2 * n + 1:
+        return None
+    tol = KEY_LEVEL_TOLERANCE_ATR * atr
+    highs, lows = sub["high"].to_numpy(), sub["low"].to_numpy()
+
+    swing_highs, swing_lows = [], []
+    for i in range(n, len(sub) - n):
+        if highs[i] == highs[i - n:i + n + 1].max():
+            swing_highs.append(highs[i])
+        if lows[i] == lows[i - n:i + n + 1].min():
+            swing_lows.append(lows[i])
+
+    near_res = [p for p in swing_highs if abs(doji["high"] - p) <= tol]
+    near_sup = [p for p in swing_lows if abs(doji["low"] - p) <= tol]
+    at_res = len(near_res) >= KEY_LEVEL_MIN_TOUCHES
+    at_sup = len(near_sup) >= KEY_LEVEL_MIN_TOUCHES
+
+    if at_res and at_sup:
+        return None  # squeezed between both: unclear, skip
+    if at_res:
+        return ("resistance", float(np.mean(near_res)))
+    if at_sup:
+        return ("support", float(np.mean(near_sup)))
+    return None
+
+
 async def check_symbol(ws, symbol: str) -> bool:
     """Returns True if an alert was sent."""
     try:
@@ -211,28 +298,59 @@ async def check_symbol(ws, symbol: str) -> bool:
         print(f"[{symbol}] last closed H1 is outside the alert window (market closed?), skipping")
         return False
 
-    pin_direction = detect_pin_bar(last_closed_h1)
-    if pin_direction is None:
-        print(f"[{symbol}] no pin bar")
+    # --- find a pattern: a pin bar first, otherwise a doji at a key level ---
+    pattern = None
+    level_note = ""
+    signal = detect_pin_bar(last_closed_h1)
+    if signal is not None:
+        pattern = "Pin Bar"
+    elif ENABLE_DOJI:
+        atr = compute_atr(df_h1.iloc[:-1], ATR_PERIOD)  # closed candles only
+        if is_doji(last_closed_h1, atr):
+            hit = doji_at_key_level(df_h1, last_closed_h1, atr)
+            if hit is not None:
+                kind, level = hit
+                signal = "bullish" if kind == "support" else "bearish"
+                pattern = f"Doji at {kind}"
+                level_note = f"Key level ({kind}): {level:.5g}\n"
+    if signal is None:
+        print(f"[{symbol}] no pin bar or doji at a key level")
         return False
 
     allowed = allowed_direction(symbol)
-    if allowed is not None and pin_direction != allowed:
-        print(f"[{symbol}] {pin_direction} ignored")
+    if allowed is not None and signal != allowed:
+        print(f"[{symbol}] {pattern} ({signal}) ignored")
         return False
 
     bias = get_bias(df_bias)
-    if pin_direction != bias:
-        print(f"[{symbol}] {pin_direction} pin bar disagrees with {BIAS_LABEL} bias ({bias})")
+    needs_bias = pattern == "Pin Bar" or DOJI_REQUIRE_BIAS
+    if needs_bias and signal != bias:
+        print(f"[{symbol}] {pattern} ({signal}) disagrees with {BIAS_LABEL} bias ({bias})")
         return False
 
+    ema_note = ""
+    if ema_filter_applies(symbol):
+        if len(df_h1) < EMA_PERIOD:
+            print(f"[{symbol}] not enough candles for the {EMA_PERIOD} EMA, skipping")
+            return False
+        ema = df_h1["close"].ewm(span=EMA_PERIOD, adjust=False).mean()
+        ema_at_signal = ema.iloc[-2]  # EMA value at the signal candle
+        trend = "bullish" if last_closed_h1["close"] > ema_at_signal else "bearish"
+        if signal != trend:
+            where = "below" if trend == "bearish" else "above"
+            print(f"[{symbol}] {pattern} ({signal}) blocked: price is {where} the {EMA_PERIOD} EMA")
+            return False
+        ema_note = f"Price {'above' if trend == 'bullish' else 'below'} {EMA_PERIOD} EMA: yes\n"
+
     ts = datetime.fromtimestamp(epoch, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    action = "SELL" if pin_direction == "bearish" else "BUY"
+    action = "SELL" if signal == "bearish" else "BUY"
     message = (
         f"🚨 Takondwa, check your trades!\n"
-        f"Pin Bar Alert - {symbol}\n"
-        f"Signal: {action} ({pin_direction.upper()} pin bar, {BIAS_LABEL} RSI bias: {bias})\n"
+        f"{pattern} Alert - {symbol}\n"
+        f"Signal: {action} ({pattern}, {BIAS_LABEL} RSI bias: {bias})\n"
         f"H1 candle close: {last_closed_h1['close']}\n"
+        f"{level_note}"
+        f"{ema_note}"
         f"Candle time: {ts}"
     )
     print(message)
