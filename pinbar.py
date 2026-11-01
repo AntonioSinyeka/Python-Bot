@@ -1,5 +1,5 @@
 """
-Pin Bar / Doji + Trend Alert Bot (Deriv) - GitHub Actions version
+Pin Bar / Doji / Engulfing + Trend Alert Bot (Deriv) - GitHub Actions version
 ==========================================================
 
 Runs ONCE per invocation (GitHub Actions starts it every hour). For each
@@ -41,8 +41,8 @@ DERIV_WS_URL = "wss://api.derivws.com/trading/v1/options/ws/public"
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-BOOM_SYMBOLS = ["BOOM100", "BOOM150", "BOOM300N", "BOOM500", "BOOM600", "BOOM900", "BOOM1000"]
-CRASH_SYMBOLS = ["CRASH100", "CRASH150", "CRASH300N", "CRASH500", "CRASH600", "CRASH900", "CRASH1000"]
+BOOM_SYMBOLS = ["BOOM100", "BOOM300N", "BOOM500", "BOOM600", "BOOM900", "BOOM1000"]
+CRASH_SYMBOLS = ["CRASH100", "CRASH300N", "CRASH500", "CRASH600", "CRASH900", "CRASH1000"]
 GOLD_AND_FOREX = [
     "frxXAUUSD",   # gold
     "frxEURUSD",
@@ -93,6 +93,12 @@ PIVOT_STRENGTH = 3              # a swing point beats the 3 candles on each side
 KEY_LEVEL_MIN_TOUCHES = 2       # a level counts only if price turned there at least twice before
 KEY_LEVEL_TOLERANCE_ATR = 0.3   # "at the level" = doji high/low within 0.3 x ATR of it
 DOJI_REQUIRE_BIAS = True        # False = skip the RSI bias rule for doji signals
+
+# Engulfing candle at a key level (uses the same key level settings as the doji).
+# Bullish engulfing at support = BUY, bearish engulfing at resistance = SELL.
+ENABLE_ENGULFING = True
+ENGULF_MIN_BODY_ATR = 0.5       # the engulfing candle's body must be >= 0.5 x ATR (ignores tiny candles)
+ENGULFING_REQUIRE_BIAS = False  # True = also require the H1 RSI bias to agree (blocks most buys at support)
 
 VOICE_TEXT = "Takondwa, check your trades"
 VOICE_FILE = "alert.mp3"
@@ -274,6 +280,58 @@ def doji_at_key_level(df: pd.DataFrame, doji: pd.Series, atr: float):
     return None
 
 
+def swing_points(sub: pd.DataFrame):
+    """Swing highs and lows: a point that beats PIVOT_STRENGTH candles on each side."""
+    n = PIVOT_STRENGTH
+    highs, lows = sub["high"].to_numpy(), sub["low"].to_numpy()
+    swing_highs, swing_lows = [], []
+    for i in range(n, len(sub) - n):
+        if highs[i] == highs[i - n:i + n + 1].max():
+            swing_highs.append(highs[i])
+        if lows[i] == lows[i - n:i + n + 1].min():
+            swing_lows.append(lows[i])
+    return swing_highs, swing_lows
+
+
+def engulfing_at_key_level(df: pd.DataFrame, atr: float):
+    """Returns ('bullish' | 'bearish', 'support' | 'resistance', level_price) or None.
+
+    The last closed candle (-2) must engulf the body of the one before it (-3),
+    and the pattern's low (bullish) or high (bearish) must sit at a key level
+    built from the candles BEFORE the pattern.
+    """
+    if len(df) < 2 * PIVOT_STRENGTH + 4 or atr is None or np.isnan(atr) or atr <= 0:
+        return None
+    cur, prev = df.iloc[-2], df.iloc[-3]
+    if abs(cur["close"] - cur["open"]) < ENGULF_MIN_BODY_ATR * atr:
+        return None
+
+    bullish = (prev["close"] < prev["open"] and cur["close"] > cur["open"]
+               and cur["open"] <= prev["close"] and cur["close"] >= prev["open"])
+    bearish = (prev["close"] > prev["open"] and cur["close"] < cur["open"]
+               and cur["open"] >= prev["close"] and cur["close"] <= prev["open"])
+    if not (bullish or bearish):
+        return None
+
+    sub = df.iloc[:-3].tail(KEY_LEVEL_LOOKBACK).reset_index(drop=True)  # before the pattern
+    if len(sub) < 2 * PIVOT_STRENGTH + 1:
+        return None
+    swing_highs, swing_lows = swing_points(sub)
+    tol = KEY_LEVEL_TOLERANCE_ATR * atr
+
+    if bullish:
+        pattern_low = min(cur["low"], prev["low"])
+        near = [p for p in swing_lows if abs(pattern_low - p) <= tol]
+        if len(near) >= KEY_LEVEL_MIN_TOUCHES:
+            return ("bullish", "support", float(np.mean(near)))
+    else:
+        pattern_high = max(cur["high"], prev["high"])
+        near = [p for p in swing_highs if abs(pattern_high - p) <= tol]
+        if len(near) >= KEY_LEVEL_MIN_TOUCHES:
+            return ("bearish", "resistance", float(np.mean(near)))
+    return None
+
+
 async def check_symbol(ws, symbol: str) -> bool:
     """Returns True if an alert was sent."""
     try:
@@ -298,23 +356,32 @@ async def check_symbol(ws, symbol: str) -> bool:
         print(f"[{symbol}] last closed H1 is outside the alert window (market closed?), skipping")
         return False
 
-    # --- find a pattern: a pin bar first, otherwise a doji at a key level ---
+    # --- find a pattern: pin bar first, then engulfing / doji at a key level ---
     pattern = None
     level_note = ""
+    require_bias = True
     signal = detect_pin_bar(last_closed_h1)
     if signal is not None:
         pattern = "Pin Bar"
-    elif ENABLE_DOJI:
+    else:
         atr = compute_atr(df_h1.iloc[:-1], ATR_PERIOD)  # closed candles only
-        if is_doji(last_closed_h1, atr):
+        if ENABLE_ENGULFING:
+            hit = engulfing_at_key_level(df_h1, atr)
+            if hit is not None:
+                signal, kind, level = hit
+                pattern = f"{signal.capitalize()} Engulfing at {kind}"
+                level_note = f"Key level ({kind}): {level:.5g}\n"
+                require_bias = ENGULFING_REQUIRE_BIAS
+        if signal is None and ENABLE_DOJI and is_doji(last_closed_h1, atr):
             hit = doji_at_key_level(df_h1, last_closed_h1, atr)
             if hit is not None:
                 kind, level = hit
                 signal = "bullish" if kind == "support" else "bearish"
                 pattern = f"Doji at {kind}"
                 level_note = f"Key level ({kind}): {level:.5g}\n"
+                require_bias = DOJI_REQUIRE_BIAS
     if signal is None:
-        print(f"[{symbol}] no pin bar or doji at a key level")
+        print(f"[{symbol}] no pin bar, engulfing or doji at a key level")
         return False
 
     allowed = allowed_direction(symbol)
@@ -323,8 +390,7 @@ async def check_symbol(ws, symbol: str) -> bool:
         return False
 
     bias = get_bias(df_bias)
-    needs_bias = pattern == "Pin Bar" or DOJI_REQUIRE_BIAS
-    if needs_bias and signal != bias:
+    if require_bias and signal != bias:
         print(f"[{symbol}] {pattern} ({signal}) disagrees with {BIAS_LABEL} bias ({bias})")
         return False
 
