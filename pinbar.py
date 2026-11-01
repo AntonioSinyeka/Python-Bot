@@ -41,8 +41,8 @@ DERIV_WS_URL = "wss://api.derivws.com/trading/v1/options/ws/public"
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-BOOM_SYMBOLS = ["BOOM100", "BOOM300N", "BOOM500", "BOOM600", "BOOM900", "BOOM1000"]
-CRASH_SYMBOLS = ["CRASH100", "CRASH300N", "CRASH500", "CRASH600", "CRASH900", "CRASH1000"]
+BOOM_SYMBOLS = ["BOOM100", "BOOM150N", "BOOM200", "BOOM300N", "BOOM500", "BOOM600", "BOOM900", "BOOM1000"]
+CRASH_SYMBOLS = ["CRASH100", "CRASH150N", "CRASH200", "CRASH300N", "CRASH500", "CRASH600", "CRASH900", "CRASH1000"]
 GOLD_AND_FOREX = [
     "frxXAUUSD",   # gold
     "frxEURUSD",
@@ -96,6 +96,26 @@ DOJI_REQUIRE_BIAS = True        # False = skip the RSI bias rule for doji signal
 
 # Engulfing candle at a key level (uses the same key level settings as the doji).
 # Bullish engulfing at support = BUY, bearish engulfing at resistance = SELL.
+# Shooting star: a looser "rejection at the top" candle, only checked when the candle is NOT a pin bar.
+# Long upper wick, small body, little lower wick, after a rise. Always a SELL signal.
+ENABLE_SHOOTING_STAR = True
+SHOOTING_STAR_BODY_RATIO = 0.35      # body <= 35% of the candle's range
+SHOOTING_STAR_UPPER_RATIO = 0.50     # upper wick >= 50% of the range (and >= 2 x the body)
+SHOOTING_STAR_LOWER_RATIO = 0.25     # lower wick <= 25% of the range
+SHOOTING_STAR_MIN_RANGE_ATR = 0.5    # range >= 0.5 x ATR (ignores tiny candles)
+SHOOTING_STAR_REQUIRE_BIAS = False   # True = also require the H1 RSI bias to agree (a rise usually means RSI > 50, which blocks sells)
+
+# Hanging man: the shooting star's cousin at the top of a rise. Small body near the top, long
+# LOWER wick, little upper wick, after a rise. Only checked when the candle is NOT a pin bar.
+# Always a SELL signal (it looks like a hammer, but after a rise it warns of a reversal down).
+ENABLE_HANGING_MAN = True
+HANGING_MAN_BODY_RATIO = 0.35        # body <= 35% of the candle's range
+HANGING_MAN_LOWER_RATIO = 0.50       # lower wick >= 50% of the range (and >= 2 x the body)
+HANGING_MAN_UPPER_RATIO = 0.25       # upper wick <= 25% of the range
+HANGING_MAN_MIN_RANGE_ATR = 0.5      # range >= 0.5 x ATR (ignores tiny candles)
+HANGING_MAN_NEAR_HIGH_ATR = 0.5      # its high must be within 0.5 x ATR of the recent highs
+HANGING_MAN_REQUIRE_BIAS = False     # True = also require the H1 RSI bias to agree (a rise usually means RSI > 50, which blocks sells)
+
 ENABLE_ENGULFING = True
 ENGULF_MIN_BODY_ATR = 0.5       # the engulfing candle's body must be >= 0.5 x ATR (ignores tiny candles)
 ENGULFING_REQUIRE_BIAS = False  # True = also require the H1 RSI bias to agree (blocks most buys at support)
@@ -293,6 +313,53 @@ def swing_points(sub: pd.DataFrame):
     return swing_highs, swing_lows
 
 
+def is_shooting_star(df: pd.DataFrame, atr: float) -> bool:
+    """Last closed candle (-2): small body, long upper wick, tiny lower wick,
+    poking above the recent highs after a rise."""
+    if len(df) < 9 or atr is None or np.isnan(atr) or atr <= 0:
+        return False
+    c = df.iloc[-2]
+    rng = c["high"] - c["low"]
+    if rng <= 0 or rng < SHOOTING_STAR_MIN_RANGE_ATR * atr:
+        return False
+    body = abs(c["close"] - c["open"])
+    upper = c["high"] - max(c["open"], c["close"])
+    lower = min(c["open"], c["close"]) - c["low"]
+    if body / rng > SHOOTING_STAR_BODY_RATIO:
+        return False
+    if upper / rng < SHOOTING_STAR_UPPER_RATIO or upper < 2 * body:
+        return False
+    if lower / rng > SHOOTING_STAR_LOWER_RATIO:
+        return False
+    rising = df["close"].iloc[-3] > df["close"].iloc[-6]             # price was rising into it
+    new_high = c["high"] >= df["high"].iloc[-8:-2].max()             # and it pushed above recent highs
+    return bool(rising and new_high)
+
+
+def is_hanging_man(df: pd.DataFrame, atr: float) -> bool:
+    """Last closed candle (-2): small body near the top, long lower wick, tiny upper
+    wick, appearing after a rise and near the recent highs."""
+    if len(df) < 9 or atr is None or np.isnan(atr) or atr <= 0:
+        return False
+    c = df.iloc[-2]
+    rng = c["high"] - c["low"]
+    if rng <= 0 or rng < HANGING_MAN_MIN_RANGE_ATR * atr:
+        return False
+    body = abs(c["close"] - c["open"])
+    upper = c["high"] - max(c["open"], c["close"])
+    lower = min(c["open"], c["close"]) - c["low"]
+    if body / rng > HANGING_MAN_BODY_RATIO:
+        return False
+    if lower / rng < HANGING_MAN_LOWER_RATIO or lower < 2 * body:
+        return False
+    if upper / rng > HANGING_MAN_UPPER_RATIO:
+        return False
+    rising = df["close"].iloc[-3] > df["close"].iloc[-6]             # price was rising into it
+    prior_high = df["high"].iloc[-8:-2].max()
+    near_high = c["high"] >= prior_high - HANGING_MAN_NEAR_HIGH_ATR * atr
+    return bool(rising and near_high)
+
+
 def engulfing_at_key_level(df: pd.DataFrame, atr: float):
     """Returns ('bullish' | 'bearish', 'support' | 'resistance', level_price) or None.
 
@@ -365,7 +432,15 @@ async def check_symbol(ws, symbol: str) -> bool:
         pattern = "Pin Bar"
     else:
         atr = compute_atr(df_h1.iloc[:-1], ATR_PERIOD)  # closed candles only
-        if ENABLE_ENGULFING:
+        if ENABLE_SHOOTING_STAR and is_shooting_star(df_h1, atr):
+            signal = "bearish"
+            pattern = "Shooting Star"
+            require_bias = SHOOTING_STAR_REQUIRE_BIAS
+        if signal is None and ENABLE_HANGING_MAN and is_hanging_man(df_h1, atr):
+            signal = "bearish"
+            pattern = "Hanging Man"
+            require_bias = HANGING_MAN_REQUIRE_BIAS
+        if signal is None and ENABLE_ENGULFING:
             hit = engulfing_at_key_level(df_h1, atr)
             if hit is not None:
                 signal, kind, level = hit
@@ -381,7 +456,7 @@ async def check_symbol(ws, symbol: str) -> bool:
                 level_note = f"Key level ({kind}): {level:.5g}\n"
                 require_bias = DOJI_REQUIRE_BIAS
     if signal is None:
-        print(f"[{symbol}] no pin bar, engulfing or doji at a key level")
+        print(f"[{symbol}] no pin bar, shooting star, hanging man, engulfing or doji at a key level")
         return False
 
     allowed = allowed_direction(symbol)
