@@ -19,6 +19,7 @@ import json
 import os
 import sys
 import time
+from collections import Counter
 from datetime import datetime, timezone
 
 import numpy as np
@@ -41,8 +42,8 @@ DERIV_WS_URL = "wss://api.derivws.com/trading/v1/options/ws/public"
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-BOOM_SYMBOLS = ["BOOM100", "BOOM150N", "BOOM200", "BOOM300N", "BOOM500", "BOOM600", "BOOM900", "BOOM1000"]
-CRASH_SYMBOLS = ["CRASH100", "CRASH150N", "CRASH200", "CRASH300N", "CRASH500", "CRASH600", "CRASH900", "CRASH1000"]
+BOOM_SYMBOLS = ["BOOM50", "BOOM100", "BOOM150N", "BOOM200", "BOOM300N", "BOOM500", "BOOM600", "BOOM900", "BOOM1000"]
+CRASH_SYMBOLS = ["CRASH50", "CRASH100", "CRASH150N", "CRASH200", "CRASH300N", "CRASH500", "CRASH600", "CRASH900", "CRASH1000"]
 GOLD_AND_FOREX = [
     "frxXAUUSD",   # gold
     "frxEURUSD",
@@ -58,7 +59,9 @@ VOLATILITY_SYMBOLS = [
     "R_10", "R_25", "R_50", "R_75", "R_100",
     "1HZ10V", "1HZ25V", "1HZ50V", "1HZ75V", "1HZ100V",
 ]
-SYMBOLS = BOOM_SYMBOLS + CRASH_SYMBOLS + VOLATILITY_SYMBOLS + GOLD_AND_FOREX
+# Step indices (Step Index plus the 200 / 300 / 400 / 500 versions): both directions, 24/7
+STEP_SYMBOLS = ["stpRNG", "stpRNG2", "stpRNG3", "stpRNG4", "stpRNG5"]
+SYMBOLS = BOOM_SYMBOLS + CRASH_SYMBOLS + VOLATILITY_SYMBOLS + STEP_SYMBOLS + GOLD_AND_FOREX
 
 RSI_PERIOD = 7
 H1_GRANULARITY = 3600        # candles used for pin bar detection
@@ -73,6 +76,17 @@ CANDLE_COUNT = 1000          # history per symbol (the 200 EMA needs a long warm
 EMA_PERIOD = 200
 APPLY_EMA_TO_BOOM_CRASH = True
 APPLY_EMA_TO_VOLATILITY = True   # set False to skip the EMA rule on Volatility indices
+
+# Which patterns must pass the 200 EMA rule (BUY above it, SELL below it)?
+# True = the rule is applied to that pattern, False = that pattern ignores the EMA.
+# (The per-asset switches above still decide which symbols use the EMA rule at all.)
+EMA_FILTER_BY_PATTERN = {
+    "Pin Bar": True,
+    "Shooting Star": False,
+    "Hanging Man": False,
+    "Engulfing": False,
+    "Doji": False,
+}
 
 PIN_WICK_RATIO = 0.66
 PIN_BODY_RATIO = 0.33
@@ -124,6 +138,22 @@ VOICE_TEXT = "Takondwa, check your trades"
 VOICE_FILE = "alert.mp3"
 
 # ------------------------------------------------------------------------
+
+
+STATS = Counter()   # why candles were skipped, printed as a summary at the end of every run
+
+
+def note(symbol: str, key: str, text: str) -> None:
+    STATS[key] += 1
+    print(f"[{symbol}] {text}")
+
+
+def print_summary() -> None:
+    order = ["candles checked", "alerts sent", "no pattern", "wrong direction for index",
+             "RSI bias disagreed", "blocked by 200 EMA", "outside alert window",
+             "not enough candles", "fetch errors"]
+    parts = [f"{k}: {STATS[k]}" for k in order if STATS[k]]
+    print("SUMMARY | " + (" | ".join(parts) if parts else "nothing checked"))
 
 
 def allowed_direction(symbol: str):
@@ -408,11 +438,11 @@ async def check_symbol(ws, symbol: str) -> bool:
         else:
             df_bias = await fetch_candles(ws, symbol, BIAS_GRANULARITY, CANDLE_COUNT)
     except Exception as exc:
-        print(f"[{symbol}] fetch error: {exc}")
+        note(symbol, "fetch errors", f"fetch error: {exc}")
         return False
 
     if len(df_h1) < 2 or len(df_bias) < RSI_PERIOD + 2:
-        print(f"[{symbol}] not enough candles")
+        note(symbol, "not enough candles", "not enough candles")
         return False
 
     last_closed_h1 = df_h1.iloc[-2]  # -1 is still forming
@@ -420,83 +450,105 @@ async def check_symbol(ws, symbol: str) -> bool:
     age = time.time() - (epoch + H1_GRANULARITY)  # seconds since that candle closed
 
     if age < 0 or age > ALERT_WINDOW_SECONDS:
-        print(f"[{symbol}] last closed H1 is outside the alert window (market closed?), skipping")
+        note(symbol, "outside alert window", "last closed H1 is outside the alert window (market closed, or the run started late), skipping")
         return False
 
-    # --- find a pattern: pin bar first, then engulfing / doji at a key level ---
-    pattern = None
-    level_note = ""
-    require_bias = True
-    signal = detect_pin_bar(last_closed_h1)
-    if signal is not None:
-        pattern = "Pin Bar"
+    STATS["candles checked"] += 1
+    rng = last_closed_h1["high"] - last_closed_h1["low"]
+    if rng > 0:
+        body_pct = abs(last_closed_h1["close"] - last_closed_h1["open"]) / rng * 100
+        up_pct = (last_closed_h1["high"] - max(last_closed_h1["open"], last_closed_h1["close"])) / rng * 100
+        lo_pct = (min(last_closed_h1["open"], last_closed_h1["close"]) - last_closed_h1["low"]) / rng * 100
+        print(f"[{symbol}] candle: body {body_pct:.0f}% | upper wick {up_pct:.0f}% | lower wick {lo_pct:.0f}%")
+
+    # --- 1. collect EVERY pattern this candle matches; each is judged on its own below ---
+    candidates = []   # each: pattern label, filter key, signal, whether RSI bias is required, level note
+    atr = compute_atr(df_h1.iloc[:-1], ATR_PERIOD)  # closed candles only
+
+    pin = detect_pin_bar(last_closed_h1)
+    if pin is not None:
+        candidates.append(dict(pattern="Pin Bar", key="Pin Bar", signal=pin, require_bias=True, level_note=""))
     else:
-        atr = compute_atr(df_h1.iloc[:-1], ATR_PERIOD)  # closed candles only
+        # shooting star / hanging man only count when the candle is NOT a pin bar
         if ENABLE_SHOOTING_STAR and is_shooting_star(df_h1, atr):
-            signal = "bearish"
-            pattern = "Shooting Star"
-            require_bias = SHOOTING_STAR_REQUIRE_BIAS
-        if signal is None and ENABLE_HANGING_MAN and is_hanging_man(df_h1, atr):
-            signal = "bearish"
-            pattern = "Hanging Man"
-            require_bias = HANGING_MAN_REQUIRE_BIAS
-        if signal is None and ENABLE_ENGULFING:
-            hit = engulfing_at_key_level(df_h1, atr)
-            if hit is not None:
-                signal, kind, level = hit
-                pattern = f"{signal.capitalize()} Engulfing at {kind}"
-                level_note = f"Key level ({kind}): {level:.5g}\n"
-                require_bias = ENGULFING_REQUIRE_BIAS
-        if signal is None and ENABLE_DOJI and is_doji(last_closed_h1, atr):
-            hit = doji_at_key_level(df_h1, last_closed_h1, atr)
-            if hit is not None:
-                kind, level = hit
-                signal = "bullish" if kind == "support" else "bearish"
-                pattern = f"Doji at {kind}"
-                level_note = f"Key level ({kind}): {level:.5g}\n"
-                require_bias = DOJI_REQUIRE_BIAS
-    if signal is None:
-        print(f"[{symbol}] no pin bar, shooting star, hanging man, engulfing or doji at a key level")
+            candidates.append(dict(pattern="Shooting Star", key="Shooting Star", signal="bearish",
+                                   require_bias=SHOOTING_STAR_REQUIRE_BIAS, level_note=""))
+        if ENABLE_HANGING_MAN and is_hanging_man(df_h1, atr):
+            candidates.append(dict(pattern="Hanging Man", key="Hanging Man", signal="bearish",
+                                   require_bias=HANGING_MAN_REQUIRE_BIAS, level_note=""))
+    if ENABLE_ENGULFING:
+        hit = engulfing_at_key_level(df_h1, atr)
+        if hit is not None:
+            sig, kind, level = hit
+            candidates.append(dict(pattern=f"{sig.capitalize()} Engulfing at {kind}", key="Engulfing", signal=sig,
+                                   require_bias=ENGULFING_REQUIRE_BIAS,
+                                   level_note=f"Key level ({kind}): {level:.5g}\n"))
+    if ENABLE_DOJI and is_doji(last_closed_h1, atr):
+        hit = doji_at_key_level(df_h1, last_closed_h1, atr)
+        if hit is not None:
+            kind, level = hit
+            candidates.append(dict(pattern=f"Doji at {kind}", key="Doji",
+                                   signal="bullish" if kind == "support" else "bearish",
+                                   require_bias=DOJI_REQUIRE_BIAS,
+                                   level_note=f"Key level ({kind}): {level:.5g}\n"))
+    if not candidates:
+        note(symbol, "no pattern", "no pin bar, shooting star, hanging man, engulfing or doji at a key level")
         return False
 
+    # --- 2. test each pattern against the filters separately: one failing pattern never hides another ---
     allowed = allowed_direction(symbol)
-    if allowed is not None and signal != allowed:
-        print(f"[{symbol}] {pattern} ({signal}) ignored")
-        return False
-
     bias = get_bias(df_bias)
-    if require_bias and signal != bias:
-        print(f"[{symbol}] {pattern} ({signal}) disagrees with {BIAS_LABEL} bias ({bias})")
+    ema_series = None
+    passed = []
+    for c in candidates:
+        sig, pat = c["signal"], c["pattern"]
+        if allowed is not None and sig != allowed:
+            note(symbol, "wrong direction for index", f"{pat} ({sig}) ignored")
+            continue
+        if c["require_bias"] and sig != bias:
+            note(symbol, "RSI bias disagreed", f"{pat} ({sig}) disagrees with {BIAS_LABEL} bias ({bias})")
+            continue
+        c["ema_note"] = ""
+        if EMA_FILTER_BY_PATTERN.get(c["key"], True) and ema_filter_applies(symbol):
+            if len(df_h1) < EMA_PERIOD:
+                note(symbol, "not enough candles", f"not enough candles for the {EMA_PERIOD} EMA, skipping")
+                continue
+            if ema_series is None:
+                ema_series = df_h1["close"].ewm(span=EMA_PERIOD, adjust=False).mean()
+            trend = "bullish" if last_closed_h1["close"] > ema_series.iloc[-2] else "bearish"
+            if sig != trend:
+                where = "below" if trend == "bearish" else "above"
+                note(symbol, "blocked by 200 EMA", f"{pat} ({sig}) blocked: price is {where} the {EMA_PERIOD} EMA")
+                continue
+            c["ema_note"] = f"Price {'above' if trend == 'bullish' else 'below'} {EMA_PERIOD} EMA: yes\n"
+        passed.append(c)
+
+    if not passed:
         return False
 
-    ema_note = ""
-    if ema_filter_applies(symbol):
-        if len(df_h1) < EMA_PERIOD:
-            print(f"[{symbol}] not enough candles for the {EMA_PERIOD} EMA, skipping")
-            return False
-        ema = df_h1["close"].ewm(span=EMA_PERIOD, adjust=False).mean()
-        ema_at_signal = ema.iloc[-2]  # EMA value at the signal candle
-        trend = "bullish" if last_closed_h1["close"] > ema_at_signal else "bearish"
-        if signal != trend:
-            where = "below" if trend == "bearish" else "above"
-            print(f"[{symbol}] {pattern} ({signal}) blocked: price is {where} the {EMA_PERIOD} EMA")
-            return False
-        ema_note = f"Price {'above' if trend == 'bullish' else 'below'} {EMA_PERIOD} EMA: yes\n"
-
+    # --- 3. one alert per direction, listing every pattern that passed ---
     ts = datetime.fromtimestamp(epoch, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    action = "SELL" if signal == "bearish" else "BUY"
-    message = (
-        f"🚨 Takondwa, check your trades!\n"
-        f"{pattern} Alert - {symbol}\n"
-        f"Signal: {action} ({pattern}, {BIAS_LABEL} RSI bias: {bias})\n"
-        f"H1 candle close: {last_closed_h1['close']}\n"
-        f"{level_note}"
-        f"{ema_note}"
-        f"Candle time: {ts}"
-    )
-    print(message)
-    send_telegram_alert(message)
-    send_voice_alert()
+    for direction in ("bullish", "bearish"):
+        group = [c for c in passed if c["signal"] == direction]
+        if not group:
+            continue
+        names = " + ".join(c["pattern"] for c in group)
+        action = "SELL" if direction == "bearish" else "BUY"
+        level_notes = "".join(dict.fromkeys(c["level_note"] for c in group))
+        ema_notes = "".join(dict.fromkeys(c["ema_note"] for c in group))
+        message = (
+            f"🚨 Takondwa, check your trades!\n"
+            f"{names} Alert - {symbol}\n"
+            f"Signal: {action} ({names}, {BIAS_LABEL} RSI bias: {bias})\n"
+            f"H1 candle close: {last_closed_h1['close']}\n"
+            f"{level_notes}"
+            f"{ema_notes}"
+            f"Candle time: {ts}"
+        )
+        print(message)
+        STATS["alerts sent"] += 1
+        send_telegram_alert(message)
+        send_voice_alert()
     return True
 
 
@@ -509,6 +561,7 @@ async def run_checks() -> None:
                 for symbol in SYMBOLS:
                     await check_symbol(ws, symbol)
                     await asyncio.sleep(0.3)  # stay well under Deriv's rate limit
+            print_summary()
             return
         except Exception as exc:
             last_exc = exc
