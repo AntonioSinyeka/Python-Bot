@@ -1,16 +1,15 @@
 """
-Pin Bar / Doji / Engulfing + Trend Alert Bot (Deriv) - GitHub Actions version
-==========================================================
+Trend + RSI Alert Bot (Deriv) - GitHub Actions version
+=====================================================
 
 Runs ONCE per invocation (GitHub Actions starts it every hour). For each
-symbol it checks the last closed H1 candle for a pin bar that agrees with
-the H1 RSI bias, then sends a Telegram text + voice alert.
-
-Rules:
-  - BOOM indices  -> only BEARISH pin bars (SELL)
-  - CRASH indices -> only BULLISH pin bars (BUY)
-  - Gold / forex / Volatility -> both directions, as long as the pin bar
-                     agrees with the RSI bias (and the 200 EMA, if enabled)
+symbol it looks at the last closed H1 candle and sends a Telegram text +
+voice alert only when:
+  - price is BELOW the 200 EMA and RSI crosses DOWN through 50  -> SELL
+  - price is ABOVE the 200 EMA and RSI crosses UP through 50    -> BUY
+Boom is SELL only and Crash is BUY only (switch: APPLY_BOOM_CRASH_DIRECTION_RULE).
+The candle patterns (pin bar, doji, engulfing, shooting star, hanging man) are
+switched OFF; set their ENABLE_ flags to True to bring them back.
 
 Signal bot only -- it does not place trades.
 """
@@ -90,6 +89,7 @@ EMA_FILTER_BY_PATTERN = {
     "Trend + RSI": False,   # this signal already contains its own EMA rule
 }
 
+ENABLE_PIN_BAR = False           # candle patterns are OFF: signals come only from the Trend + RSI rule below
 PIN_WICK_RATIO = 0.55          # long wick: was 0.66 (66% of the candle), now 55%
 PIN_BODY_RATIO = 0.40          # body: was 0.33 (33%), now up to 40%
 PIN_OPPOSITE_WICK_RATIO = 0.25 # opposite wick: was 0.15 (15%), now up to 25%
@@ -100,7 +100,7 @@ PIN_OPPOSITE_WICK_RATIO = 0.25 # opposite wick: was 0.15 (15%), now up to 25%
 ALERT_WINDOW_SECONDS = 55 * 60
 
 # Doji at a key level (support / resistance) -- a second pattern besides pin bars.
-ENABLE_DOJI = True
+ENABLE_DOJI = False
 DOJI_BODY_RATIO = 0.10          # body must be <= 10% of the candle's range
 DOJI_MIN_RANGE_ATR = 0.5        # candle range must be >= 0.5 x ATR (ignores tiny, meaningless candles)
 ATR_PERIOD = 14
@@ -114,7 +114,7 @@ DOJI_REQUIRE_BIAS = True        # False = skip the RSI bias rule for doji signal
 # Bullish engulfing at support = BUY, bearish engulfing at resistance = SELL.
 # Shooting star: a looser "rejection at the top" candle, only checked when the candle is NOT a pin bar.
 # Long upper wick, small body, little lower wick, after a rise. Always a SELL signal.
-ENABLE_SHOOTING_STAR = True
+ENABLE_SHOOTING_STAR = False
 SHOOTING_STAR_BODY_RATIO = 0.35      # body <= 35% of the candle's range
 SHOOTING_STAR_UPPER_RATIO = 0.50     # upper wick >= 50% of the range (and >= 2 x the body)
 SHOOTING_STAR_LOWER_RATIO = 0.25     # lower wick <= 25% of the range
@@ -124,7 +124,7 @@ SHOOTING_STAR_REQUIRE_BIAS = False   # True = also require the H1 RSI bias to ag
 # Hanging man: the shooting star's cousin at the top of a rise. Small body near the top, long
 # LOWER wick, little upper wick, after a rise. Only checked when the candle is NOT a pin bar.
 # Always a SELL signal (it looks like a hammer, but after a rise it warns of a reversal down).
-ENABLE_HANGING_MAN = True
+ENABLE_HANGING_MAN = False
 HANGING_MAN_BODY_RATIO = 0.35        # body <= 35% of the candle's range
 HANGING_MAN_LOWER_RATIO = 0.50       # lower wick >= 50% of the range (and >= 2 x the body)
 HANGING_MAN_UPPER_RATIO = 0.25       # upper wick <= 25% of the range
@@ -132,15 +132,17 @@ HANGING_MAN_MIN_RANGE_ATR = 0.5      # range >= 0.5 x ATR (ignores tiny candles)
 HANGING_MAN_NEAR_HIGH_ATR = 0.5      # its high must be within 0.5 x ATR of the recent highs
 HANGING_MAN_REQUIRE_BIAS = False     # True = also require the H1 RSI bias to agree (a rise usually means RSI > 50, which blocks sells)
 
-# Trend + RSI signal (no candle pattern needed), on the H1 chart:
-#   price BELOW the 200 EMA and RSI under 50  -> SELL
-#   price ABOVE the 200 EMA and RSI over 50   -> BUY
-# "on_change"    = alert on the first closed candle where the condition becomes true (no repeats while it holds)
-# "every_candle" = alert on EVERY closed candle where it is true (can mean an alert every hour per symbol)
+# Trend + RSI signal (the main rule), on the H1 chart, using the last CLOSED candle:
+#   price BELOW the 200 EMA and RSI crosses DOWN through 50  -> SELL
+#   price ABOVE the 200 EMA and RSI crosses UP through 50    -> BUY
+# Alert modes:
+#   "rsi_cross"    = alert only on the candle where RSI crosses 50 in that direction, with price on the right side of the EMA
+#   "on_change"    = alert on the first candle where (price vs EMA) AND (RSI side of 50) both line up
+#   "every_candle" = alert on EVERY closed candle where they line up (can mean an alert every hour per symbol)
 ENABLE_TREND_RSI_SIGNAL = True
-TREND_RSI_ALERT_MODE = "on_change"
+TREND_RSI_ALERT_MODE = "rsi_cross"
 
-ENABLE_ENGULFING = True
+ENABLE_ENGULFING = False
 ENGULF_MIN_BODY_ATR = 0.5       # the engulfing candle's body must be >= 0.5 x ATR (ignores tiny candles)
 ENGULFING_REQUIRE_BIAS = False  # True = also require the H1 RSI bias to agree (blocks most buys at support)
 
@@ -190,8 +192,13 @@ def print_summary() -> None:
     print("SUMMARY | " + (" | ".join(parts) if parts else "nothing checked"))
 
 
+APPLY_BOOM_CRASH_DIRECTION_RULE = True   # True: Boom alerts SELL only, Crash BUY only. False: both directions everywhere
+
+
 def allowed_direction(symbol: str):
     """Boom -> bearish only, Crash -> bullish only, anything else -> both."""
+    if not APPLY_BOOM_CRASH_DIRECTION_RULE:
+        return None
     if symbol.startswith("BOOM"):
         return "bearish"
     if symbol.startswith("CRASH"):
@@ -544,7 +551,7 @@ async def check_symbol(ws, symbol: str) -> bool:
     alt = []    # shooting star, hanging man: used when there is no pin bar, or when the pin bar is rejected by a filter
     atr = compute_atr(df_h1.iloc[:-1], ATR_PERIOD)  # closed candles only
 
-    pin = detect_pin_bar(last_closed_h1)
+    pin = detect_pin_bar(last_closed_h1) if ENABLE_PIN_BAR else None
     if pin is not None:
         main.append(dict(pattern="Pin Bar", key="Pin Bar", signal=pin, require_bias=True, level_note=""))
     if ENABLE_SHOOTING_STAR and is_shooting_star(df_h1, atr):
@@ -576,11 +583,23 @@ async def check_symbol(ws, symbol: str) -> bool:
         now_state = trend_rsi_state(closes_all.iloc[i], ema_all.iloc[i], rsi_all.iloc[i])
         prev_state = trend_rsi_state(closes_all.iloc[i - 1], ema_all.iloc[i - 1], rsi_all.iloc[i - 1])
         fresh = now_state is not None and now_state != prev_state
-        rep(symbol, f"Trend + RSI: {now_state or 'no signal'}" + (" (new this candle)" if fresh else (" (already running)" if now_state else "")))
-        if now_state is not None and (TREND_RSI_ALERT_MODE == "every_candle" or fresh):
+        rsi_prev, rsi_now = rsi_all.iloc[i - 1], rsi_all.iloc[i]
+        crossed_up = bool(rsi_prev <= 50 < rsi_now)
+        crossed_down = bool(rsi_prev >= 50 > rsi_now)
+        if TREND_RSI_ALERT_MODE == "rsi_cross":
+            fire = (now_state == "bullish" and crossed_up) or (now_state == "bearish" and crossed_down)
+        elif TREND_RSI_ALERT_MODE == "every_candle":
+            fire = now_state is not None
+        else:
+            fire = fresh
+        side = "above" if closes_all.iloc[i] > ema_all.iloc[i] else "below"
+        cross_txt = "RSI crossed UP through 50" if crossed_up else ("RSI crossed DOWN through 50" if crossed_down else "no RSI cross")
+        rep(symbol, f"Price is {side} the {EMA_PERIOD} EMA | RSI({RSI_PERIOD}) {rsi_prev:.1f} -> {rsi_now:.1f} ({cross_txt})")
+        rep(symbol, f"Trend + RSI: {'SIGNAL ' + now_state if fire else 'no signal'} (mode: {TREND_RSI_ALERT_MODE})")
+        if fire:
             below = now_state == "bearish"
             main.append(dict(pattern="Trend + RSI", key="Trend + RSI", signal=now_state, require_bias=False,
-                             level_note=f"Price {'below' if below else 'above'} the {EMA_PERIOD} EMA and RSI({RSI_PERIOD}) {rsi_all.iloc[i]:.1f} ({'under' if below else 'over'} 50)\n"))
+                             level_note=f"Price {'below' if below else 'above'} the {EMA_PERIOD} EMA | RSI({RSI_PERIOD}) {rsi_prev:.1f} -> {rsi_now:.1f} ({cross_txt})\n"))
     rep(symbol, "Patterns matched: " + (", ".join(c["pattern"] for c in main + alt) or "none"))
     try:
         rsi_val = compute_rsi(df_bias.iloc[:-1]["close"], RSI_PERIOD).iloc[-1]
