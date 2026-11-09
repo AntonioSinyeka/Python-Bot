@@ -49,10 +49,9 @@ GOLD_AND_FOREX = [
     "frxEURUSD",
     "frxGBPUSD",
     "frxUSDJPY",
-    "frxUSDCHF",
-    "frxAUDUSD",
-    "frxUSDCAD",
-    "frxNZDUSD",
+    "frxEURGBP",
+    "frxEURJPY",
+    "frxGBPJPY",
 ]
 # Volatility indices: regular ones, plus the "1s" (one-second tick) versions
 VOLATILITY_SYMBOLS = [
@@ -61,7 +60,9 @@ VOLATILITY_SYMBOLS = [
 ]
 # Step indices (Step Index plus the 200 / 300 / 400 / 500 versions): both directions, 24/7
 STEP_SYMBOLS = ["stpRNG", "stpRNG2", "stpRNG3", "stpRNG4", "stpRNG5"]
-SYMBOLS = BOOM_SYMBOLS + CRASH_SYMBOLS + VOLATILITY_SYMBOLS + STEP_SYMBOLS + GOLD_AND_FOREX
+# Jump indices (Jump 10 / 25 / 50 / 75 / 100): both directions, 24/7
+JUMP_SYMBOLS = ["JD10", "JD25", "JD50", "JD75", "JD100"]
+SYMBOLS = BOOM_SYMBOLS + CRASH_SYMBOLS + VOLATILITY_SYMBOLS + STEP_SYMBOLS + JUMP_SYMBOLS + GOLD_AND_FOREX
 
 RSI_PERIOD = 7
 H1_GRANULARITY = 3600        # candles used for pin bar detection
@@ -86,11 +87,12 @@ EMA_FILTER_BY_PATTERN = {
     "Hanging Man": False,
     "Engulfing": False,
     "Doji": False,
+    "Trend + RSI": False,   # this signal already contains its own EMA rule
 }
 
-PIN_WICK_RATIO = 0.66
-PIN_BODY_RATIO = 0.33
-PIN_OPPOSITE_WICK_RATIO = 0.15
+PIN_WICK_RATIO = 0.55          # long wick: was 0.66 (66% of the candle), now 55%
+PIN_BODY_RATIO = 0.40          # body: was 0.33 (33%), now up to 40%
+PIN_OPPOSITE_WICK_RATIO = 0.25 # opposite wick: was 0.15 (15%), now up to 25%
 
 # Only alert if the pin bar candle closed within this many seconds.
 # The workflow runs hourly, so each candle is seen by one run; this is what
@@ -130,6 +132,14 @@ HANGING_MAN_MIN_RANGE_ATR = 0.5      # range >= 0.5 x ATR (ignores tiny candles)
 HANGING_MAN_NEAR_HIGH_ATR = 0.5      # its high must be within 0.5 x ATR of the recent highs
 HANGING_MAN_REQUIRE_BIAS = False     # True = also require the H1 RSI bias to agree (a rise usually means RSI > 50, which blocks sells)
 
+# Trend + RSI signal (no candle pattern needed), on the H1 chart:
+#   price BELOW the 200 EMA and RSI under 50  -> SELL
+#   price ABOVE the 200 EMA and RSI over 50   -> BUY
+# "on_change"    = alert on the first closed candle where the condition becomes true (no repeats while it holds)
+# "every_candle" = alert on EVERY closed candle where it is true (can mean an alert every hour per symbol)
+ENABLE_TREND_RSI_SIGNAL = True
+TREND_RSI_ALERT_MODE = "on_change"
+
 ENABLE_ENGULFING = True
 ENGULF_MIN_BODY_ATR = 0.5       # the engulfing candle's body must be >= 0.5 x ATR (ignores tiny candles)
 ENGULFING_REQUIRE_BIAS = False  # True = also require the H1 RSI bias to agree (blocks most buys at support)
@@ -143,15 +153,39 @@ VOICE_FILE = "alert.mp3"
 STATS = Counter()   # why candles were skipped, printed as a summary at the end of every run
 
 
+# Symbols that get a short "check report" on Telegram after EVERY run (arrives silently).
+# It shows exactly what the bot saw on the last closed candle and why it did or did not alert,
+# so you can compare it with your chart. Set to [] to turn the reports off.
+DEBUG_REPORT_SYMBOLS = ["BOOM200", "frxXAUUSD"]
+REPORTS = {}
+
+
+def rep(symbol: str, text: str) -> None:
+    REPORTS.setdefault(symbol, []).append(text)
+
+
 def note(symbol: str, key: str, text: str) -> None:
     STATS[key] += 1
     print(f"[{symbol}] {text}")
+    rep(symbol, text)
+
+
+def send_debug_reports() -> None:
+    for sym in DEBUG_REPORT_SYMBOLS:
+        lines = REPORTS.get(sym)
+        if lines:
+            body = "\n".join(lines)
+        elif sym in SYMBOLS:
+            body = "No data was checked for this symbol in this run."
+        else:
+            body = "This symbol is not in the SYMBOLS list."
+        send_telegram_alert(f"🔎 Check report - {sym}\n{body}", silent=True)
 
 
 def print_summary() -> None:
     order = ["candles checked", "alerts sent", "no pattern", "wrong direction for index",
              "RSI bias disagreed", "blocked by 200 EMA", "outside alert window",
-             "not enough candles", "fetch errors"]
+             "not enough candles", "fetch errors", "symbol codes not found"]
     parts = [f"{k}: {STATS[k]}" for k in order if STATS[k]]
     print("SUMMARY | " + (" | ".join(parts) if parts else "nothing checked"))
 
@@ -180,10 +214,13 @@ def telegram_ready() -> bool:
     return True
 
 
-def send_telegram_alert(message: str) -> None:
+def send_telegram_alert(message: str, silent: bool = False) -> None:
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    data = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
+    if silent:
+        data["disable_notification"] = True   # arrives without buzzing your phone
     try:
-        resp = requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": message}, timeout=15)
+        resp = requests.post(url, data=data, timeout=15)
         if resp.status_code != 200:
             print(f"[telegram] text failed: {resp.status_code} {resp.text}")
     except Exception as exc:
@@ -343,6 +380,17 @@ def swing_points(sub: pd.DataFrame):
     return swing_highs, swing_lows
 
 
+def trend_rsi_state(close: float, ema: float, rsi: float):
+    """'bearish' = below the EMA with RSI under 50, 'bullish' = above it with RSI over 50, else None."""
+    if np.isnan(ema) or np.isnan(rsi):
+        return None
+    if close < ema and rsi < 50:
+        return "bearish"
+    if close > ema and rsi > 50:
+        return "bullish"
+    return None
+
+
 def is_shooting_star(df: pd.DataFrame, atr: float) -> bool:
     """Last closed candle (-2): small body, long upper wick, tiny lower wick,
     poking above the recent highs after a rise."""
@@ -429,6 +477,32 @@ def engulfing_at_key_level(df: pd.DataFrame, atr: float):
     return None
 
 
+async def fetch_active_symbols(ws) -> set:
+    """Asks Deriv which symbol codes exist (public request, no token needed)."""
+    await ws.send(json.dumps({"active_symbols": "brief"}))
+    response = json.loads(await ws.recv())
+    items = response.get("active_symbols", [])
+    return {i.get("underlying_symbol") or i.get("symbol") for i in items} - {None}
+
+
+def report_missing_symbols(active: set) -> None:
+    """Prints (and silently messages you) any configured symbol code Deriv does not list."""
+    if not active:
+        print("[symbols] Deriv returned no symbol list, skipping the symbol check")
+        return
+    missing = [s for s in SYMBOLS if s not in active]
+    if not missing:
+        print("[symbols] every configured symbol code exists on Deriv")
+        return
+    STATS["symbol codes not found"] += len(missing)
+    hints = sorted(a for a in active if any(k in a.upper() for k in ("BOOM", "CRASH", "XAUUSD", "GOLD", "STPRNG", "STEP", "JD", "JUMP")))
+    text = "🧭 Symbol check\nCodes Deriv does not list (they will fail to load): " + ", ".join(missing)
+    if hints:
+        text += "\nSimilar codes that DO exist: " + ", ".join(hints)
+    print(text)
+    send_telegram_alert(text, silent=True)
+
+
 async def check_symbol(ws, symbol: str) -> bool:
     """Returns True if an alert was sent."""
     try:
@@ -449,6 +523,9 @@ async def check_symbol(ws, symbol: str) -> bool:
     epoch = int(last_closed_h1["epoch"])
     age = time.time() - (epoch + H1_GRANULARITY)  # seconds since that candle closed
 
+    rep(symbol, f"Last closed H1 candle: {datetime.fromtimestamp(epoch, tz=timezone.utc).strftime('%d %b %H:%M UTC')} (closed {age / 60:.0f} min ago)")
+    rep(symbol, f"O {last_closed_h1['open']} H {last_closed_h1['high']} L {last_closed_h1['low']} C {last_closed_h1['close']}")
+
     if age < 0 or age > ALERT_WINDOW_SECONDS:
         note(symbol, "outside alert window", "last closed H1 is outside the alert window (market closed, or the run started late), skipping")
         return False
@@ -460,68 +537,97 @@ async def check_symbol(ws, symbol: str) -> bool:
         up_pct = (last_closed_h1["high"] - max(last_closed_h1["open"], last_closed_h1["close"])) / rng * 100
         lo_pct = (min(last_closed_h1["open"], last_closed_h1["close"]) - last_closed_h1["low"]) / rng * 100
         print(f"[{symbol}] candle: body {body_pct:.0f}% | upper wick {up_pct:.0f}% | lower wick {lo_pct:.0f}%")
+        rep(symbol, f"Shape: body {body_pct:.0f}% | upper wick {up_pct:.0f}% | lower wick {lo_pct:.0f}%")
 
     # --- 1. collect EVERY pattern this candle matches; each is judged on its own below ---
-    candidates = []   # each: pattern label, filter key, signal, whether RSI bias is required, level note
+    main = []   # pin bar, engulfing, doji
+    alt = []    # shooting star, hanging man: used when there is no pin bar, or when the pin bar is rejected by a filter
     atr = compute_atr(df_h1.iloc[:-1], ATR_PERIOD)  # closed candles only
 
     pin = detect_pin_bar(last_closed_h1)
     if pin is not None:
-        candidates.append(dict(pattern="Pin Bar", key="Pin Bar", signal=pin, require_bias=True, level_note=""))
-    else:
-        # shooting star / hanging man only count when the candle is NOT a pin bar
-        if ENABLE_SHOOTING_STAR and is_shooting_star(df_h1, atr):
-            candidates.append(dict(pattern="Shooting Star", key="Shooting Star", signal="bearish",
-                                   require_bias=SHOOTING_STAR_REQUIRE_BIAS, level_note=""))
-        if ENABLE_HANGING_MAN and is_hanging_man(df_h1, atr):
-            candidates.append(dict(pattern="Hanging Man", key="Hanging Man", signal="bearish",
-                                   require_bias=HANGING_MAN_REQUIRE_BIAS, level_note=""))
+        main.append(dict(pattern="Pin Bar", key="Pin Bar", signal=pin, require_bias=True, level_note=""))
+    if ENABLE_SHOOTING_STAR and is_shooting_star(df_h1, atr):
+        alt.append(dict(pattern="Shooting Star", key="Shooting Star", signal="bearish",
+                        require_bias=SHOOTING_STAR_REQUIRE_BIAS, level_note=""))
+    if ENABLE_HANGING_MAN and is_hanging_man(df_h1, atr):
+        alt.append(dict(pattern="Hanging Man", key="Hanging Man", signal="bearish",
+                        require_bias=HANGING_MAN_REQUIRE_BIAS, level_note=""))
     if ENABLE_ENGULFING:
         hit = engulfing_at_key_level(df_h1, atr)
         if hit is not None:
             sig, kind, level = hit
-            candidates.append(dict(pattern=f"{sig.capitalize()} Engulfing at {kind}", key="Engulfing", signal=sig,
-                                   require_bias=ENGULFING_REQUIRE_BIAS,
-                                   level_note=f"Key level ({kind}): {level:.5g}\n"))
+            main.append(dict(pattern=f"{sig.capitalize()} Engulfing at {kind}", key="Engulfing", signal=sig,
+                             require_bias=ENGULFING_REQUIRE_BIAS,
+                             level_note=f"Key level ({kind}): {level:.5g}\n"))
     if ENABLE_DOJI and is_doji(last_closed_h1, atr):
         hit = doji_at_key_level(df_h1, last_closed_h1, atr)
         if hit is not None:
             kind, level = hit
-            candidates.append(dict(pattern=f"Doji at {kind}", key="Doji",
-                                   signal="bullish" if kind == "support" else "bearish",
-                                   require_bias=DOJI_REQUIRE_BIAS,
-                                   level_note=f"Key level ({kind}): {level:.5g}\n"))
-    if not candidates:
+            main.append(dict(pattern=f"Doji at {kind}", key="Doji",
+                             signal="bullish" if kind == "support" else "bearish",
+                             require_bias=DOJI_REQUIRE_BIAS,
+                             level_note=f"Key level ({kind}): {level:.5g}\n"))
+    if ENABLE_TREND_RSI_SIGNAL and len(df_h1) >= EMA_PERIOD + 3:
+        closes_all = df_h1["close"]
+        ema_all = closes_all.ewm(span=EMA_PERIOD, adjust=False).mean()
+        rsi_all = compute_rsi(closes_all.iloc[:-1], RSI_PERIOD)   # closed candles only
+        i = len(df_h1) - 2                                         # the last closed candle
+        now_state = trend_rsi_state(closes_all.iloc[i], ema_all.iloc[i], rsi_all.iloc[i])
+        prev_state = trend_rsi_state(closes_all.iloc[i - 1], ema_all.iloc[i - 1], rsi_all.iloc[i - 1])
+        fresh = now_state is not None and now_state != prev_state
+        rep(symbol, f"Trend + RSI: {now_state or 'no signal'}" + (" (new this candle)" if fresh else (" (already running)" if now_state else "")))
+        if now_state is not None and (TREND_RSI_ALERT_MODE == "every_candle" or fresh):
+            below = now_state == "bearish"
+            main.append(dict(pattern="Trend + RSI", key="Trend + RSI", signal=now_state, require_bias=False,
+                             level_note=f"Price {'below' if below else 'above'} the {EMA_PERIOD} EMA and RSI({RSI_PERIOD}) {rsi_all.iloc[i]:.1f} ({'under' if below else 'over'} 50)\n"))
+    rep(symbol, "Patterns matched: " + (", ".join(c["pattern"] for c in main + alt) or "none"))
+    try:
+        rsi_val = compute_rsi(df_bias.iloc[:-1]["close"], RSI_PERIOD).iloc[-1]
+        rep(symbol, f"{BIAS_LABEL} RSI({RSI_PERIOD}): {rsi_val:.1f} -> {'bullish' if rsi_val > 50 else 'bearish'} bias")
+        if len(df_h1) >= EMA_PERIOD:
+            ema_now = df_h1["close"].ewm(span=EMA_PERIOD, adjust=False).mean().iloc[-2]
+            rep(symbol, f"{EMA_PERIOD} EMA: {ema_now:.5g} (price is {'above' if last_closed_h1['close'] > ema_now else 'below'} it)")
+    except Exception:
+        pass
+    if not main and not alt:
         note(symbol, "no pattern", "no pin bar, shooting star, hanging man, engulfing or doji at a key level")
         return False
 
     # --- 2. test each pattern against the filters separately: one failing pattern never hides another ---
     allowed = allowed_direction(symbol)
     bias = get_bias(df_bias)
-    ema_series = None
-    passed = []
-    for c in candidates:
-        sig, pat = c["signal"], c["pattern"]
-        if allowed is not None and sig != allowed:
-            note(symbol, "wrong direction for index", f"{pat} ({sig}) ignored")
-            continue
-        if c["require_bias"] and sig != bias:
-            note(symbol, "RSI bias disagreed", f"{pat} ({sig}) disagrees with {BIAS_LABEL} bias ({bias})")
-            continue
-        c["ema_note"] = ""
-        if EMA_FILTER_BY_PATTERN.get(c["key"], True) and ema_filter_applies(symbol):
-            if len(df_h1) < EMA_PERIOD:
-                note(symbol, "not enough candles", f"not enough candles for the {EMA_PERIOD} EMA, skipping")
+    cache = {}
+
+    def evaluate(cands):
+        ok = []
+        for c in cands:
+            sig, pat = c["signal"], c["pattern"]
+            if allowed is not None and sig != allowed:
+                note(symbol, "wrong direction for index", f"{pat} ({sig}) ignored")
                 continue
-            if ema_series is None:
-                ema_series = df_h1["close"].ewm(span=EMA_PERIOD, adjust=False).mean()
-            trend = "bullish" if last_closed_h1["close"] > ema_series.iloc[-2] else "bearish"
-            if sig != trend:
-                where = "below" if trend == "bearish" else "above"
-                note(symbol, "blocked by 200 EMA", f"{pat} ({sig}) blocked: price is {where} the {EMA_PERIOD} EMA")
+            if c["require_bias"] and sig != bias:
+                note(symbol, "RSI bias disagreed", f"{pat} ({sig}) disagrees with {BIAS_LABEL} bias ({bias})")
                 continue
-            c["ema_note"] = f"Price {'above' if trend == 'bullish' else 'below'} {EMA_PERIOD} EMA: yes\n"
-        passed.append(c)
+            c["ema_note"] = ""
+            if EMA_FILTER_BY_PATTERN.get(c["key"], True) and ema_filter_applies(symbol):
+                if len(df_h1) < EMA_PERIOD:
+                    note(symbol, "not enough candles", f"not enough candles for the {EMA_PERIOD} EMA, skipping")
+                    continue
+                if "ema" not in cache:
+                    cache["ema"] = df_h1["close"].ewm(span=EMA_PERIOD, adjust=False).mean()
+                trend = "bullish" if last_closed_h1["close"] > cache["ema"].iloc[-2] else "bearish"
+                if sig != trend:
+                    where = "below" if trend == "bearish" else "above"
+                    note(symbol, "blocked by 200 EMA", f"{pat} ({sig}) blocked: price is {where} the {EMA_PERIOD} EMA")
+                    continue
+                c["ema_note"] = f"Price {'above' if trend == 'bullish' else 'below'} {EMA_PERIOD} EMA: yes\n"
+            ok.append(c)
+        return ok
+
+    passed = evaluate(main)
+    if alt and not any(c["pattern"] == "Pin Bar" for c in passed):
+        passed += evaluate(alt)   # shooting star / hanging man, when no pin bar passed
 
     if not passed:
         return False
@@ -547,6 +653,7 @@ async def check_symbol(ws, symbol: str) -> bool:
         )
         print(message)
         STATS["alerts sent"] += 1
+        rep(symbol, f"ALERT SENT: {action} - {names}")
         send_telegram_alert(message)
         send_voice_alert()
     return True
@@ -558,10 +665,15 @@ async def run_checks() -> None:
     for attempt in range(1, 4):
         try:
             async with websockets.connect(DERIV_WS_URL, open_timeout=20) as ws:
+                try:
+                    report_missing_symbols(await fetch_active_symbols(ws))
+                except Exception as exc:
+                    print(f"[symbols] symbol check failed: {exc}")
                 for symbol in SYMBOLS:
                     await check_symbol(ws, symbol)
                     await asyncio.sleep(0.3)  # stay well under Deriv's rate limit
             print_summary()
+            send_debug_reports()
             return
         except Exception as exc:
             last_exc = exc
