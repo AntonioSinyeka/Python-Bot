@@ -3,7 +3,7 @@ Trend + RSI Alert Bot (Deriv) - GitHub Actions version
 =====================================================
 
 Runs ONCE per invocation (GitHub Actions starts it every hour). For each
-symbol it looks at the last closed H1 candle and sends a Telegram text +
+symbol it looks at the last closed candle (see TIMEFRAME_SECONDS: M30 by default) and sends a Telegram text +
 voice alert only when:
   - price is BELOW the 200 EMA and RSI crosses DOWN through 50  -> SELL
   - price is ABOVE the 200 EMA and RSI crosses UP through 50    -> BUY
@@ -57,17 +57,20 @@ VOLATILITY_SYMBOLS = [
     "R_10", "R_25", "R_50", "R_75", "R_100",
     "1HZ10V", "1HZ25V", "1HZ50V", "1HZ75V", "1HZ100V",
 ]
+# Stock indices: US Tech 100 (Nasdaq), Wall Street 30 (Dow Jones), US 500 (S&P 500). Both directions.
+# They follow stock-market hours, so they are quiet on weekends and overnight.
+INDEX_SYMBOLS = ["OTC_NDX", "OTC_DJI", "OTC_SPC"]
 # Step indices (Step Index plus the 200 / 300 / 400 / 500 versions): both directions, 24/7
 STEP_SYMBOLS = ["stpRNG", "stpRNG2", "stpRNG3", "stpRNG4", "stpRNG5"]
-# Jump indices (Jump 10 / 25 / 50 / 75 / 100): both directions, 24/7
-JUMP_SYMBOLS = ["JD10", "JD25", "JD50", "JD75", "JD100"]
-SYMBOLS = BOOM_SYMBOLS + CRASH_SYMBOLS + VOLATILITY_SYMBOLS + STEP_SYMBOLS + JUMP_SYMBOLS + GOLD_AND_FOREX
+SYMBOLS = BOOM_SYMBOLS + CRASH_SYMBOLS + VOLATILITY_SYMBOLS + STEP_SYMBOLS + INDEX_SYMBOLS + GOLD_AND_FOREX
 
 RSI_PERIOD = 7
-H1_GRANULARITY = 3600        # candles used for pin bar detection
-BIAS_GRANULARITY = 3600      # candles used for the RSI trend bias (3600 = H1, 14400 = H4)
-BIAS_LABEL = "H1" if BIAS_GRANULARITY == 3600 else "H4"
-CANDLE_COUNT = 1000          # history per symbol (the 200 EMA needs a long warm-up)
+TIMEFRAME_SECONDS = 1800     # THE CHART TIMEFRAME: 1800 = 30 minutes (M30), 3600 = 1 hour (H1), 900 = 15 minutes
+TIMEFRAME_LABEL = {900: "M15", 1800: "M30", 3600: "H1", 7200: "H2", 14400: "H4"}.get(TIMEFRAME_SECONDS, f"{TIMEFRAME_SECONDS // 60}m")
+H1_GRANULARITY = TIMEFRAME_SECONDS   # (name kept from the older 1-hour version) candle size for the signal
+BIAS_GRANULARITY = TIMEFRAME_SECONDS # candle size for the RSI / EMA
+BIAS_LABEL = TIMEFRAME_LABEL
+CANDLE_COUNT = 600           # history per symbol (the 200 EMA needs a long warm-up)
 
 # 200 EMA trend filter on H1: BUY only when the pin bar closes ABOVE the EMA,
 # SELL only when it closes BELOW it.
@@ -96,8 +99,8 @@ PIN_OPPOSITE_WICK_RATIO = 0.25 # opposite wick: was 0.15 (15%), now up to 25%
 
 # Only alert if the pin bar candle closed within this many seconds.
 # The workflow runs hourly, so each candle is seen by one run; this is what
-# stops duplicate alerts (nothing is remembered between runs). Keep < 3600.
-ALERT_WINDOW_SECONDS = 55 * 60
+# stops duplicate alerts (nothing is remembered between runs). Must stay below the candle size.
+ALERT_WINDOW_SECONDS = TIMEFRAME_SECONDS - 5 * 60   # 25 minutes on M30, 55 minutes on H1
 
 # Doji at a key level (support / resistance) -- a second pattern besides pin bars.
 ENABLE_DOJI = False
@@ -132,7 +135,7 @@ HANGING_MAN_MIN_RANGE_ATR = 0.5      # range >= 0.5 x ATR (ignores tiny candles)
 HANGING_MAN_NEAR_HIGH_ATR = 0.5      # its high must be within 0.5 x ATR of the recent highs
 HANGING_MAN_REQUIRE_BIAS = False     # True = also require the H1 RSI bias to agree (a rise usually means RSI > 50, which blocks sells)
 
-# Trend + RSI signal (the main rule), on the H1 chart, using the last CLOSED candle:
+# Trend + RSI signal (the main rule), on the chart timeframe (TIMEFRAME_SECONDS), using the last CLOSED candle:
 #   price BELOW the 200 EMA and RSI crosses DOWN through 50  -> SELL
 #   price ABOVE the 200 EMA and RSI crosses UP through 50    -> BUY
 # Alert modes:
@@ -152,13 +155,14 @@ VOICE_FILE = "alert.mp3"
 # ------------------------------------------------------------------------
 
 
+ALERTED = set()   # (symbol, candle time, direction) already alerted, so retries and restarts of a check never repeat an alert
 STATS = Counter()   # why candles were skipped, printed as a summary at the end of every run
 
 
 # Symbols that get a short "check report" on Telegram after EVERY run (arrives silently).
 # It shows exactly what the bot saw on the last closed candle and why it did or did not alert,
 # so you can compare it with your chart. Set to [] to turn the reports off.
-DEBUG_REPORT_SYMBOLS = ["BOOM200", "frxXAUUSD"]
+DEBUG_REPORT_SYMBOLS = []   # check reports are OFF. To watch a symbol again, list it here, e.g. ["BOOM200"]
 REPORTS = {}
 
 
@@ -492,7 +496,7 @@ async def fetch_active_symbols(ws) -> set:
     return {i.get("underlying_symbol") or i.get("symbol") for i in items} - {None}
 
 
-def report_missing_symbols(active: set) -> None:
+def report_missing_symbols(active: set, send: bool = True) -> None:
     """Prints (and silently messages you) any configured symbol code Deriv does not list."""
     if not active:
         print("[symbols] Deriv returned no symbol list, skipping the symbol check")
@@ -502,12 +506,13 @@ def report_missing_symbols(active: set) -> None:
         print("[symbols] every configured symbol code exists on Deriv")
         return
     STATS["symbol codes not found"] += len(missing)
-    hints = sorted(a for a in active if any(k in a.upper() for k in ("BOOM", "CRASH", "XAUUSD", "GOLD", "STPRNG", "STEP", "JD", "JUMP")))
+    hints = sorted(a for a in active if any(k in a.upper() for k in ("BOOM", "CRASH", "XAUUSD", "GOLD", "STPRNG", "STEP", "OTC_", "NDX", "SPC", "DJI")))
     text = "🧭 Symbol check\nCodes Deriv does not list (they will fail to load): " + ", ".join(missing)
     if hints:
         text += "\nSimilar codes that DO exist: " + ", ".join(hints)
     print(text)
-    send_telegram_alert(text, silent=True)
+    if send:
+        send_telegram_alert(text, silent=True)
 
 
 async def check_symbol(ws, symbol: str) -> bool:
@@ -530,11 +535,11 @@ async def check_symbol(ws, symbol: str) -> bool:
     epoch = int(last_closed_h1["epoch"])
     age = time.time() - (epoch + H1_GRANULARITY)  # seconds since that candle closed
 
-    rep(symbol, f"Last closed H1 candle: {datetime.fromtimestamp(epoch, tz=timezone.utc).strftime('%d %b %H:%M UTC')} (closed {age / 60:.0f} min ago)")
+    rep(symbol, f"Last closed {TIMEFRAME_LABEL} candle: {datetime.fromtimestamp(epoch, tz=timezone.utc).strftime('%d %b %H:%M UTC')} (closed {age / 60:.0f} min ago)")
     rep(symbol, f"O {last_closed_h1['open']} H {last_closed_h1['high']} L {last_closed_h1['low']} C {last_closed_h1['close']}")
 
     if age < 0 or age > ALERT_WINDOW_SECONDS:
-        note(symbol, "outside alert window", "last closed H1 is outside the alert window (market closed, or the run started late), skipping")
+        note(symbol, "outside alert window", f"last closed {TIMEFRAME_LABEL} candle is outside the alert window (market closed, or the run started late), skipping")
         return False
 
     STATS["candles checked"] += 1
@@ -653,10 +658,15 @@ async def check_symbol(ws, symbol: str) -> bool:
 
     # --- 3. one alert per direction, listing every pattern that passed ---
     ts = datetime.fromtimestamp(epoch, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    sent_any = False
     for direction in ("bullish", "bearish"):
         group = [c for c in passed if c["signal"] == direction]
         if not group:
             continue
+        alert_key = (symbol, epoch, direction)
+        if alert_key in ALERTED:
+            continue
+        ALERTED.add(alert_key)
         names = " + ".join(c["pattern"] for c in group)
         action = "SELL" if direction == "bearish" else "BUY"
         level_notes = "".join(dict.fromkeys(c["level_note"] for c in group))
@@ -665,7 +675,7 @@ async def check_symbol(ws, symbol: str) -> bool:
             f"🚨 Takondwa, check your trades!\n"
             f"{names} Alert - {symbol}\n"
             f"Signal: {action} ({names}, {BIAS_LABEL} RSI bias: {bias})\n"
-            f"H1 candle close: {last_closed_h1['close']}\n"
+            f"{TIMEFRAME_LABEL} candle close: {last_closed_h1['close']}\n"
             f"{level_notes}"
             f"{ema_notes}"
             f"Candle time: {ts}"
@@ -675,31 +685,73 @@ async def check_symbol(ws, symbol: str) -> bool:
         rep(symbol, f"ALERT SENT: {action} - {names}")
         send_telegram_alert(message)
         send_voice_alert()
-    return True
+        sent_any = True
+    return sent_any
 
 
-async def run_checks() -> None:
+async def run_checks(exit_on_fail: bool = True, quiet: bool = False) -> bool:
+    """One full pass over every symbol. quiet=True skips the silent Telegram reports (used for the retry pass)."""
+    STATS.clear()
+    REPORTS.clear()
     # Deriv/Cloudflare sometimes rejects the handshake (HTTP 520), so retry.
     last_exc = None
     for attempt in range(1, 4):
         try:
             async with websockets.connect(DERIV_WS_URL, open_timeout=20) as ws:
                 try:
-                    report_missing_symbols(await fetch_active_symbols(ws))
+                    report_missing_symbols(await fetch_active_symbols(ws), send=not quiet)
                 except Exception as exc:
                     print(f"[symbols] symbol check failed: {exc}")
                 for symbol in SYMBOLS:
                     await check_symbol(ws, symbol)
                     await asyncio.sleep(0.3)  # stay well under Deriv's rate limit
             print_summary()
-            send_debug_reports()
-            return
+            if not quiet:
+                send_debug_reports()
+            return True
         except Exception as exc:
             last_exc = exc
             print(f"[deriv] connection attempt {attempt} failed: {exc}")
             await asyncio.sleep(5 * attempt)
     print(f"[deriv] giving up after 3 attempts: {last_exc}")
-    sys.exit(1)
+    if exit_on_fail:
+        sys.exit(1)
+    return False
+
+
+# ---------------------------- always-on mode ----------------------------
+# Run with:  python pinbar.py --loop      (or set the variable ALWAYS_ON=1)
+# It wakes up 20 seconds after every candle close (e.g. :00 and :30 on M30) and again
+# 2 minutes after as a retry for slow price feeds, so alerts arrive within seconds of the
+# close instead of waiting for a scheduled GitHub run.
+LOOP_CHECK_OFFSETS = (20, 120)          # seconds after each candle close (UTC)
+HEARTBEAT_EVERY_SECONDS = 24 * 3600     # one silent "still running" message a day
+
+
+async def loop_forever() -> None:
+    print(f"Always-on mode: checking 20 s and 2 min after every {TIMEFRAME_LABEL} candle close (UTC).")
+    send_telegram_alert("🟢 Takondwa, the bot is running in always-on mode.", silent=True)
+    last_heartbeat = time.time()
+
+    async def safe_run(quiet: bool) -> None:
+        try:
+            await run_checks(exit_on_fail=False, quiet=quiet)
+        except Exception as exc:          # one bad pass must never stop the loop
+            print(f"[loop] check failed: {exc}")
+
+    await safe_run(quiet=False)           # catch-up pass: alerts for a signal from the last few minutes
+    while True:
+        now = time.time()
+        base = int(now // TIMEFRAME_SECONDS) * TIMEFRAME_SECONDS
+        upcoming = [(base + off, i) for i, off in enumerate(LOOP_CHECK_OFFSETS) if base + off > now]
+        if not upcoming:
+            upcoming = [(base + TIMEFRAME_SECONDS + LOOP_CHECK_OFFSETS[0], 0)]
+        when, idx = min(upcoming)
+        await asyncio.sleep(max(0.0, when - now))
+        await safe_run(quiet=(idx != 0))
+        if time.time() - last_heartbeat >= HEARTBEAT_EVERY_SECONDS:
+            send_telegram_alert("✅ Bot is still running.", silent=True)
+            last_heartbeat = time.time()
 
 
 def main() -> None:
@@ -712,7 +764,10 @@ def main() -> None:
         print("Test alert sent.")
         return
 
-    asyncio.run(run_checks())
+    if "--loop" in sys.argv or os.getenv("ALWAYS_ON") == "1":
+        asyncio.run(loop_forever())
+    else:
+        asyncio.run(run_checks())
 
 
 if __name__ == "__main__":
